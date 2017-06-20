@@ -38,8 +38,8 @@ public class portrait_bot_mars extends PApplet {
 // GLOBAL VARIABLES
 //------------------------------------------------------------------------------
 // DEBUG
-Boolean VERBOSE = false; //print all responses from GRBL
-Boolean SIMPLE_MODE = false; //line-response mode(true) / buffer-fill mode(false)
+Boolean VERBOSE = false; //default: false -- if enabled, print all responses from GRBL
+Boolean SIMPLE_MODE = false; //default: false (buffer-fill mode) / true (line-response mode)
 int reportFreq = 5; //
 // IO
 Boolean type_gcode = true;
@@ -66,11 +66,10 @@ String status;
 Boolean streaming, spraying, paused, loaded, idle;
 String versionPattern = "Grbl*";
 String startupPattern = ">*:ok";
-String echoPattern = "*echo: *";
 String statusPattern = "<*>";
 String okPattern = "*ok*";
 String errorPattern = "*error*";
-String CMD_VERSION, CMD_STARTUP, CMD_ECHO, CMD_STATUS, CMD_OK, CMD_ERROR;
+String CMD_VERSION, CMD_STARTUP, CMD_STATUS, CMD_OK, CMD_ERROR;
 Boolean match;
 // STREAM MODE
 IntList c_line;
@@ -86,61 +85,51 @@ int timeout = 0;
 // SETUP
 //------------------------------------------------------------------------------
 public void setup() {
-  settings();
+  settings(); //INITIALIZE WINDOW SIZE
 
-  initVariables();
-  initPatterns();
+  initVariables(); //INITIALIZE SYSTEM VARIABLES
+  initPatterns(); //INITIALIZE MESSAGE PATTERNS
 
-  initFonts();
-  initColors();
+  initFonts(); //INITIALIZE UX FONTS
+  initColors(); //INITIALIZE UX COLORS
 
-  initPreview( );
+  initPreview( ); //INITIALIZE GCODE PREVIEW
 
-  setupControls();
-  selectSerial();
+  setupControls(); //GENERATE UX
+  selectSerial(); //ATTEMPT TO CONNECT TO SERIAL
 }
 
 // DRAW
 //------------------------------------------------------------------------------
 public void draw(){
-  displayUI();
+  displayUI(); // DRAW UI
+  renderPreview( ); // DRAW GCODE PREVIEW
+  displayStats(); // DISPLAY DRAWING STATUS
+  checkStatus(); // UPDATE BUTTONS BY STATE
 
-  renderPreview( );
-
-  displayStats();
-  checkStatus();
-
-
-  // realtime reporting
+  // REALTIME STATUS REPORTING
   if(connected && r>reportFreq){
     statusReport();
     r = 0;
   }
   r++;
 
+  if (connected) serialRun(); // CHECK SERIAL FOR UPDATES
+  renderNozzle(); // DRAW NOZZLE ON PREVIEW
 
-  if (connected) serialRun();
-  renderNozzle();
-
+  // TIMEOUT IF SYSTEM HANGS
+  // FIRST SHUTS OFF SPRAY
+  // THEN CANCELS STREAM AND GOES HOME
   if( idle && spraying && timeout > 120 ){
     send( gSpray(false) );
   }
-
   if( idle && streaming ){
     timeout++;
-
-    // if ( timeout % 60 == 0 ){
-    //   String cmd = gcode.get(line).trim().replace(" ","");
-    //   port.write( cmd + "\n" );
-    //   print("RE-SENT: "+cmd+"\n");
-    // }
-
-    if ( timeout > 600 ){
+    if ( timeout > 1200 ){
       print("TIMED OUT, GOING HOME\n");
       streaming = false;
       line = 0;
       timeout = 0;
-      // send( gSpray(false) );
       send( home() );
     }
   }
@@ -156,7 +145,7 @@ public void settings(){
 // INIT VARIABLES
 public void initVariables(){
   // UX
-  origin = new PVector(950,375);
+  origin = new PVector(950,350);
   scalar = 0.5f;
   // GCODE
   gcode = new StringList();
@@ -192,23 +181,31 @@ public void initVariables(){
 public void initPatterns(){
   CMD_VERSION = versionPattern.replaceAll(".","[$0]").replace("[*]",".*");
   CMD_STARTUP = startupPattern.replaceAll(".","[$0]").replace("[*]",".*");
-  CMD_ECHO = echoPattern.replaceAll(".","[$0]").replace("[*]",".*");
   CMD_STATUS = statusPattern.replaceAll(".","[$0]").replace("[*]",".*");
   CMD_OK = okPattern.replaceAll(".","[$0]").replace("[*]",".*");
   CMD_ERROR = errorPattern.replaceAll(".","[$0]").replace("[*]",".*");
 
 }
 
+// PARSE NUMBER FROM GCODE STRING
+// Used to extract numerical values from GCode
 public float parseNumber(String s, String c, float f){
+  String num = "-.0123456789";
   c = c.toUpperCase();
   s = s.toUpperCase();
-  int index = s.indexOf(c);
-  if( index < 0 ) return f;
-  int endIndex = s.indexOf(" ",index);
-  if( endIndex  < 0 ) endIndex = s.length();
-  return PApplet.parseFloat( s.substring(index+1, endIndex) );
+  int start = s.indexOf(c);
+  if( start < 0 ) return f;
+  int end = start+1;
+  for( int i = start+1; i < s.length(); i++){
+    char k = s.charAt(i);
+    if( Character.isLetter(k) || k == ' ') break;
+    end = i;
+  }
+  return PApplet.parseFloat( s.substring(start+1,end+1) );
 }
 
+// SUMS IntList
+// Sums contents of an IntList (used in available buffer tracking)
 public int sumList(IntList w){
   int sum = 0;
   for(int i = 0; i<w.size();i++){
@@ -244,21 +241,39 @@ public void generatePreview(StringList g){
 
   for(int i = 0; i<g.size(); i++){
     String cmd = g.get(i);
-    if( cmd.startsWith("G0 ") || cmd.startsWith("G1 ")){
-      type = PApplet.parseInt( cmd.charAt(1) );
-      c = (type=='0') ? blue : red;
-      w = (type=='0') ? 1 : 3;
-      o = (type=='0') ? 255 : 55;
+    type = PApplet.parseInt(parseNumber(cmd,"G",-1));
+    if( type < 0 ) continue;
 
-      renderLine(last, cmd, c, o, w);
+    // COLOR, LINEWEIGHT, OPACITY SETTINGS
+    c = (type==0||type==4) ? blue : red;
+    w = (type==0||type==4) ? 2 : 3;
+    o = (type==0||type==4) ? 255 : 85;
+
+    switch(type){
+      case 0:
+      case 1:
+        renderLine(last, cmd, c, o, w);
+        break;
+      case 2:
+      case 3:
+        renderArc(last, cmd, type, c, o, w);
+        break;
+      case 4:
+        renderPoint(last, c, o, w);
+        break;
+      default:
+        break;
     }
   }
 }
 
+// RENDER LINE
+// Visualizes GCODE line command (G0/G1)
 public void renderLine(PVector l, String cmd, int c, float o, float w ){
   PShape ln;
   float x = parseNumber(cmd,"X",l.x);
   float y = parseNumber(cmd,"Y",l.y);
+  noFill();
   stroke(c,o);
   strokeWeight(w);
   ln = createShape( LINE, l.x*scalar, -l.y*scalar, x*scalar, -y*scalar );
@@ -266,6 +281,55 @@ public void renderLine(PVector l, String cmd, int c, float o, float w ){
   preview.addChild( ln );
   l.x = x;
   l.y = y;
+}
+
+// RENDER ARC
+// Visualizes GCODE arc command (G2/G3)
+public void renderArc( PVector l, String cmd, int dir, int c, float o, float w ){
+  PShape a;
+
+  float cx = parseNumber(cmd, "I", 0.0f)+l.x;
+  float cy = parseNumber(cmd, "J", 0.0f)+l.y;
+  float x = parseNumber(cmd, "X", l.x);
+  float y = parseNumber(cmd, "Y", l.y);
+  float dx2 = l.x - cx;
+  float dy2 = l.y - cy;
+  float dx1 = x - cx;
+  float dy1 = y - cy;
+
+  float r = sqrt( pow(dx1,2) + pow(dy1,2) );
+
+  float SA = TWO_PI - atan2(dy1, dx1);
+  float EA = TWO_PI - atan2(dy2, dx2);
+
+  if( dir == 3 && SA > EA){
+    EA += TWO_PI;
+  } else if( dir == 2 && EA > SA){
+    SA += TWO_PI;
+  }
+
+  noFill();
+  stroke(c,o);
+  strokeWeight(w);
+
+  if( dir == 2){
+    a = createShape(ARC, cx*scalar, -cy*scalar, r*2*scalar, r*2*scalar, EA, SA);
+  } else {
+    a = createShape(ARC, cx*scalar, -cy*scalar, r*2*scalar, r*2*scalar, SA, EA);
+  }
+  preview.addChild(a);
+  l.x = x;
+  l.y = y;
+}
+
+// RENDER POINT
+// Visualizes GCODE dwell command (G4)
+public void renderPoint( PVector l, int c, float o, float w){
+  PShape p;
+  stroke(c,o);
+  strokeWeight(w*3);
+  p = createShape(POINT, l.x*scalar, -l.y*scalar);
+  preview.addChild(p);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -287,16 +351,16 @@ public void openSerial(){
     closeSerial();
     println("DISCONNECTED: NO SERIAL CONNECTION AVAILABLE");
   }
-
-
 }
 
+// RESET ALL SERIAL VARIABLES
 public void closeSerial(){
   portname = null;
   connected = false;
   port = null;
 }
 
+// SELECT SERIAL PORT TO OPEN
 public void selectSerial(){
   int s = Serial.list().length;
   if( s == 0 ){
@@ -319,6 +383,7 @@ public void selectSerial(){
   openSerial();
 }
 
+// UPDATE SERIAL CONNECTION & CHECK FOR DATA
 public void serialRun(){
   if(port.available() > 0){
     String temp = port.readStringUntil('\n');
@@ -338,34 +403,18 @@ public void serialRun(){
       extractDim();
       return;
     }
-
-    val = (temp.matches(CMD_ECHO))?val:temp;
-
     if(temp.matches(CMD_ERROR)){
       print("[ERROR] " + temp +"\n");
       print("[SENT] " + sent + "\n");
       return;
     }
 
-    // if( temp.contains("echo: ]") ){
-    //   // if(VERBOSE) print("[ECHO] "+temp+"\n");
-    //   ignore = true;
-    // }
-
-    if(temp.matches(CMD_ECHO)){
-      String rx = temp.substring(7,temp.length()-1);
-      if( rx.contains(lastSent)) match = true;
-      if(VERBOSE) print("[ECHO] "+temp+"\n");
-    }
-
     if(SIMPLE_MODE){
-      if( temp.matches(CMD_OK) && match){
+      if( temp.matches(CMD_OK) ){
         if(VERBOSE) print("[RX] "+temp+"\n");
         line++;
         completed++;
         timeout = 0;
-        match = false;
-        // ignore = false;
       }
     }
     else {
@@ -376,23 +425,23 @@ public void serialRun(){
           completed++;
         }
         timeout = 0;
-        // ignore = false;
       }
     }
-
   }
+  //SEND GCODE
   stream();
 }
 
+// REQUEST MACHINE POSITION REPORT
 public void statusReport(){
   sendByte( report() );
 }
 
+// EXTRACT DIMENSIONS FROM MACHINE REPORT
 public void extractDim(){
   String[] temp_stat = status.substring(1,status.length()-1).split("\\|");
   //Extract machine status
   idle = temp_stat[0].contains("Idle");
-
   //Extract Work Position
   String[] temp_pos = temp_stat[1].substring(5).split(",");
   posx = PApplet.parseFloat(temp_pos[0]);
@@ -400,7 +449,7 @@ public void extractDim(){
   //Extract Servo Position
   int servoPos = PApplet.parseInt( temp_stat[3].substring(4).split(",")[1] );
   spraying = (servoPos == sprayon );
-
+  //Format status message for UX
   status = join(subset(temp_stat,0,4), " | ");
 }
 
@@ -421,6 +470,7 @@ public void sendByte( Byte b ){
   if(VERBOSE) sent = str(PApplet.parseChar(b));
 }
 
+// RESET SERIAL STREAM STATUS
 public void resetStatus(){
   line = 0;
   issued = 0;
@@ -844,7 +894,6 @@ public void renderNozzle(){
 
   // Nozzle Icon
   stroke( (spraying)?red:blue );
-  // if(spraying) stroke(blue);
   fill(white,50);
   strokeWeight(3);
   ellipse(posx*scalar,-(posy*scalar),10,10);
@@ -858,7 +907,15 @@ public void renderNozzle(){
   textFont(font14,14);
   textAlign(CENTER);
   text(pos,(posx*scalar),-(posy*scalar) + 24.0f);
+
+  rectMode(CENTER);
+  noStroke();
+  fill(255,100);
+  rect(posx*scalar,-posy*scalar+20, textWidth(pos)+10,20,10);
+  rectMode(CORNER);
+
   popMatrix();
+
 }
 
 // DISPLAY STATS
@@ -899,7 +956,7 @@ public void displayStats(){
   textFont(font18,18);
   fill( (status.contains("Idle")) ? white : (status.contains("Run")) ? green : red );
   textAlign(CENTER);
-  text(status, origin.x, origin.y+350);
+  text(status, origin.x, origin.y+375);
 
   // File Selection
   if(fp.length()>0){
@@ -923,21 +980,6 @@ public void setupControls() {
   cP5.setColorValueLabel( white );
   cP5.setColorCaptionLabel( white );
   cP5.setColorActive( blue );
-
-  // Report Button
-  cP5.addBang("report")
-  .setPosition(origin.x-50,10)
-  .setSize(100,25)
-  .setTriggerEvent(Bang.RELEASE)
-  .setColorForeground(white)
-  .setColorActive(blue)
-  //caption settings
-  .getCaptionLabel()
-  .align(ControlP5.CENTER, ControlP5.CENTER)
-  .setColor(black)
-  .setFont(font12)
-  .setText("REPORT")
-  ;
 
   // Serial Connect Button
   cP5.addBang("connect")
@@ -1335,7 +1377,7 @@ public void setupControls() {
   .setColor(white)
   .setFont(font14)
   .alignX(ControlP5.LEFT)
-  .setText("MANUAL GCODE ENTRY")
+  .setText("MANUAL ENTRY")
   ;
 }
 
@@ -1344,9 +1386,6 @@ public void controlEvent( ControlEvent theEvent ) {
   if ( theEvent.isController() ) {
     String eventName = theEvent.getName();
     switch( eventName ) {
-      case "report":
-        if(!streaming) statusReport();
-        break;
       case "connect":
         if(connected){
           port.stop();
@@ -1444,7 +1483,6 @@ public void controlEvent( ControlEvent theEvent ) {
         }
         if(!streaming){
           updateSpeed();
-          // print("STARTING STREAM\n");
           streaming = true;
           stream();
         }
@@ -1486,28 +1524,6 @@ public void checkStatus(){
     relabelButton( connect, "CONNECT" );
     return;
   }
-
-  // if( connected ){
-  //   relabelButton( connect, "RECONNECT" );
-  // }
-  //
-  // if( !loaded && !paused ){
-  //   lockButton( start, false, green, white );
-  //   relabelButton( start, "START" );
-  //   lockButton( pause, false, red, white );
-  //   relabelButton( pause, "PAUSE" );
-  //   relabelButton( load, "LOAD");
-  //   return;
-  // }
-  //
-  // if( !loaded && paused ){
-  //   lockButton( start, false, red, white );
-  //   relabelButton( start, "RESET" );
-  //   lockButton( pause, false, green, white );
-  //   relabelButton( pause, "RESUME" );
-  //   relabelButton( load, "LOAD");
-  //   return;
-  // }
 
   if( loaded ){
     relabelButton( load, "RELOAD" );
@@ -1558,10 +1574,6 @@ public void lockButton(Bang button, boolean lock, int c, int t){
   button.setLock(lock)
   .setColorForeground(c)
   .getCaptionLabel().setColor(t);
-}
-
-public void lockButton(Toggle button, boolean lock, int c, int t){
-  button.setLock(lock);
 }
 
 // MANUAL ENTRY
