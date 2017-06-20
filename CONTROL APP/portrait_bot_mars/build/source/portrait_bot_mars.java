@@ -25,9 +25,6 @@ public class portrait_bot_mars extends PApplet {
 // v4.0 2017.06.12                                                            //
 //                                                                            //
 ////////////////////////////////////////////////////////////////////////////////
-// ACKNOWLEGDEMENTS
-// GRBL streaming methods & Serial connection based on GCTRL
-// https://github.com/damellis/gctrl
 
 // EXTERNAL DEPENDENCIES
 //------------------------------------------------------------------------------
@@ -532,25 +529,25 @@ public void stream(){
 // G0/G1 - LINE COMMAND
 public String gLine(float x, float y, boolean f){
   String cmd = (f) ? "G1" : "G0";
-  cmd += " X"+str(x) + " Y"+str(y);
+  cmd += "X"+str(x) + "Y"+str(y);
   return cmd;
 }
 
 // G2/G3 - ARC COMMANDS
 public String gArc(float cx, float cy, float x, float y, boolean dir){
   //clockwise = 2 ... counterclockwise = 3
-  if( dir ) return "G2 I"+str(cx) + " J"+str(cy) + " X"+str(x) + " Y"+str(y) + " F"+str(PApplet.parseInt(spray_speed));
-  else return "G3 I" + str(cx) + " J" + str(cy) + " X" + str(x) + " Y" + str(y) + " F"+str(PApplet.parseInt(spray_speed));
+  if( dir ) return "G2I"+str(cx) + "J"+str(cy) + "X"+str(x) + "Y"+str(y) + "F"+str(PApplet.parseInt(spray_speed));
+  else return "G3I" + str(cx) + "J" + str(cy) + "X" + str(x) + "Y" + str(y) + "F"+str(PApplet.parseInt(spray_speed));
 }
 
 // G4 - PAUSE COMMAND
 public String gDwell( float time ){
-  return "G4 P" + str(time);
+  return "G4P" + str(time);
 }
 
 // M3 - SPRAY COMMAND
 public String gSpray( boolean s ){
-  return "M3 S" + ((s) ? str(sprayon) : str(sprayoff));
+  return "M3S" + ((s) ? str(sprayon) : str(sprayoff));
 }
 
 // Report
@@ -720,6 +717,10 @@ public StringList processGCODEs( String[] f ){
     load = loadStrings(fp+"\\"+f[i]);
 
     for(int k = 0; k < load.length; k++){
+      //ignore home commands at beginning & end of file
+      if( k <= 3 && load[k].contains("G0X0Y0")) continue;
+      if( load[k].length() < 1 ) continue;
+      if( k >= load.length-3 && load[k].contains("G0X0Y0")) continue;
       g.append(load[k]);
     }
     g.append(gSpray(false));
@@ -903,16 +904,16 @@ public void renderNozzle(){
 
   // Nozzle Position Text
   String pos = "( "+nf(posx,0,2)+", "+nf(posy,0,2)+" )";
-  fill( (spraying) ? red : blue );
-  textFont(font14,14);
-  textAlign(CENTER);
-  text(pos,(posx*scalar),-(posy*scalar) + 24.0f);
-
   rectMode(CENTER);
   noStroke();
   fill(255,100);
   rect(posx*scalar,-posy*scalar+20, textWidth(pos)+10,20,10);
   rectMode(CORNER);
+
+  fill( (spraying) ? black : blue );
+  textFont(font14,14);
+  textAlign(CENTER);
+  text(pos,(posx*scalar),-(posy*scalar) + 24.0f);
 
   popMatrix();
 
