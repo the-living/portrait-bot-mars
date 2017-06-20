@@ -18,9 +18,12 @@ import javax.swing.JOptionPane; //Interface for COM port selection
 // GLOBAL VARIABLES
 //------------------------------------------------------------------------------
 // DEBUG
-Boolean VERBOSE = false;
-int reportFreq = 20; //
+Boolean VERBOSE = false; //print all responses from GRBL
+Boolean SIMPLE_MODE = false; //line-response mode(true) / buffer-fill mode(false)
+int reportFreq = 5; //
 // IO
+Boolean type_gcode = true;
+Boolean load_dir = true;
 String fp = "";
 // UX
 ControlP5 cP5;
@@ -32,19 +35,30 @@ PShape preview;
 // GCODE
 StringList gcode;
 int line;
+int issued, completed;
 // MACHINE
-String status;
-int poll = 0;
 float posx, posy, lastx, lasty, spray_speed;
 float canvas_width, canvas_height, canvas_margin;
 int sprayoff = 10;
-int sprayon = 200;
+int sprayon = 110;
 // STATUS
-Boolean streaming, spraying, paused, loaded;
+String status;
+Boolean streaming, spraying, paused, loaded, idle;
+String versionPattern = "Grbl*";
+String startupPattern = ">*:ok";
+String echoPattern = "*echo: *";
+String statusPattern = "<*>";
+String okPattern = "*ok*";
+String errorPattern = "*error*";
+String CMD_VERSION, CMD_STARTUP, CMD_ECHO, CMD_STATUS, CMD_OK, CMD_ERROR;
+Boolean match;
+// STREAM MODE
+IntList c_line;
 // SERIAL
 Serial port;
 String portname;
 String val, sent;
+String lastSent;
 Boolean connected;
 int r = 0;
 int timeout = 0;
@@ -53,7 +67,10 @@ int timeout = 0;
 //------------------------------------------------------------------------------
 void setup() {
   settings();
+
   initVariables();
+  initPatterns();
+
   initFonts();
   initColors();
 
@@ -76,15 +93,37 @@ void draw(){
 
   // realtime reporting
   if(connected && r>reportFreq){
-    statusReport(paused);
+    statusReport();
+    r = 0;
   }
+  r++;
 
 
   if (connected) serialRun();
   renderNozzle();
 
-  // if( poll > 20) poll = 1;
+  if( idle && spraying && timeout > 120 ){
+    send( gSpray(false) );
+  }
 
+  if( idle && streaming ){
+    timeout++;
+
+    // if ( timeout % 60 == 0 ){
+    //   String cmd = gcode.get(line).trim().replace(" ","");
+    //   port.write( cmd + "\n" );
+    //   print("RE-SENT: "+cmd+"\n");
+    // }
+
+    if ( timeout > 600 ){
+      print("TIMED OUT, GOING HOME\n");
+      streaming = false;
+      line = 0;
+      timeout = 0;
+      // send( gSpray(false) );
+      send( home() );
+    }
+  }
 }
 
 // SETTINGS
@@ -102,10 +141,12 @@ void initVariables(){
   // GCODE
   gcode = new StringList();
   line = 0;
+  issued = 0;
+  completed = 0;
   // MACHINE
   posx = 0.0;
   posy = 0.0;
-  status = "";
+  status = "[...]";
   spray_speed = 5000.0;
   canvas_width = 1220.0;
   canvas_height = 1220.0;
@@ -115,12 +156,27 @@ void initVariables(){
   spraying = false;
   paused = false;
   loaded = false;
+  match = false;
+  idle = false;
+  //STREAM MODE
+  c_line = new IntList();
   // SERIAL
   port = null;
   portname = null;
   val = "...";
   sent = "...";
   connected = false;
+  lastSent = "";
+}
+
+void initPatterns(){
+  CMD_VERSION = versionPattern.replaceAll(".","[$0]").replace("[*]",".*");
+  CMD_STARTUP = startupPattern.replaceAll(".","[$0]").replace("[*]",".*");
+  CMD_ECHO = echoPattern.replaceAll(".","[$0]").replace("[*]",".*");
+  CMD_STATUS = statusPattern.replaceAll(".","[$0]").replace("[*]",".*");
+  CMD_OK = okPattern.replaceAll(".","[$0]").replace("[*]",".*");
+  CMD_ERROR = errorPattern.replaceAll(".","[$0]").replace("[*]",".*");
+
 }
 
 float parseNumber(String s, String c, float f){
@@ -131,6 +187,14 @@ float parseNumber(String s, String c, float f){
   int endIndex = s.indexOf(" ",index);
   if( endIndex  < 0 ) endIndex = s.length();
   return float( s.substring(index+1, endIndex) );
+}
+
+int sumList(IntList w){
+  int sum = 0;
+  for(int i = 0; i<w.size();i++){
+    sum += w.get(i);
+  }
+  return sum;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -185,6 +249,214 @@ void renderLine(PVector l, String cmd, color c, float o, float w ){
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// SERIAL COMMUNICATION
+////////////////////////////////////////////////////////////////////////////////
+
+// OPEN SERIAL PORT
+void openSerial(){
+  if( portname == null ){
+    connected = false;
+    return;
+  }
+  if( port != null ) port.stop();
+  try{
+    port = new Serial(this, portname, 115200);
+    port.bufferUntil('\n');
+    connected = true;
+  } catch( Exception e){
+    closeSerial();
+    println("DISCONNECTED: NO SERIAL CONNECTION AVAILABLE");
+  }
+
+
+}
+
+void closeSerial(){
+  portname = null;
+  connected = false;
+  port = null;
+}
+
+void selectSerial(){
+  int s = Serial.list().length;
+  if( s == 0 ){
+    JOptionPane.showMessageDialog(null, "No Arduino Connected");
+    return;
+  }
+  if( s > 1){
+    String result = (String) JOptionPane.showInputDialog(
+      null,
+      "Select the serial port connected to Arduino",
+      "Select serial port",
+      JOptionPane.PLAIN_MESSAGE,
+      null,
+      Serial.list(),
+      0
+    );
+    if( result != null ) portname = result;
+  }
+  else portname = Serial.list()[0];
+  openSerial();
+}
+
+void serialRun(){
+  if(port.available() > 0){
+    String temp = port.readStringUntil('\n');
+    if(temp == null) return;
+    temp = temp.trim();
+
+    if(temp.matches(CMD_VERSION)){
+      if(VERBOSE) print("[STARTUP] "+temp+"\n");
+      return;
+    }
+    if(temp.matches(CMD_STARTUP)){
+      if(VERBOSE) print("[STARTUP] "+temp+"\n");
+      return;
+    }
+    if(temp.matches(CMD_STATUS)){
+      status = temp;
+      extractDim();
+      return;
+    }
+
+    val = (temp.matches(CMD_ECHO))?val:temp;
+
+    if(temp.matches(CMD_ERROR)){
+      print("[ERROR] " + temp +"\n");
+      print("[SENT] " + sent + "\n");
+      return;
+    }
+
+    // if( temp.contains("echo: ]") ){
+    //   // if(VERBOSE) print("[ECHO] "+temp+"\n");
+    //   ignore = true;
+    // }
+
+    if(temp.matches(CMD_ECHO)){
+      String rx = temp.substring(7,temp.length()-1);
+      if( rx.contains(lastSent)) match = true;
+      if(VERBOSE) print("[ECHO] "+temp+"\n");
+    }
+
+    if(SIMPLE_MODE){
+      if( temp.matches(CMD_OK) && match){
+        if(VERBOSE) print("[RX] "+temp+"\n");
+        line++;
+        completed++;
+        timeout = 0;
+        match = false;
+        // ignore = false;
+      }
+    }
+    else {
+      if( temp.matches(CMD_OK)){
+        if(VERBOSE) print("[RX] "+temp+"\n");
+        if(c_line.size()>0){
+          c_line.remove(0);
+          completed++;
+        }
+        timeout = 0;
+        // ignore = false;
+      }
+    }
+
+  }
+  stream();
+}
+
+void statusReport(){
+  sendByte( report() );
+}
+
+void extractDim(){
+  String[] temp_stat = status.substring(1,status.length()-1).split("\\|");
+  //Extract machine status
+  idle = temp_stat[0].contains("Idle");
+
+  //Extract Work Position
+  String[] temp_pos = temp_stat[1].substring(5).split(",");
+  posx = float(temp_pos[0]);
+  posy = float(temp_pos[1]);
+  //Extract Servo Position
+  int servoPos = int( temp_stat[3].substring(4).split(",")[1] );
+  spraying = (servoPos == sprayon );
+
+  status = join(subset(temp_stat,0,4), " | ");
+}
+
+// SERIAL SEND
+void send( String cmd ){
+  if(!connected) return;
+  cmd = cmd.trim().replace(" ","");
+  sent = cmd;
+  port.write(cmd + "\n");
+
+  if( VERBOSE ) print("SENT: " + cmd + '\n');
+}
+
+// SERIAL SEND BYTE
+void sendByte( Byte b ){
+  if(!connected) return;
+  port.write( b );
+  if(VERBOSE) sent = str(char(b));
+}
+
+void resetStatus(){
+  line = 0;
+  issued = 0;
+  completed = 0;
+  c_line = new IntList();
+}
+
+// SERIAL STREAM
+void stream(){
+  if(!connected || !streaming) return;
+
+  while(true){
+    if( line >= gcode.size() || line < 0 ){
+      if( line>0 ){
+        print("COMPLETED STREAMING\n");
+        //streaming = false;
+        line = -1;
+      } else if ( c_line.size() == 0 ) {
+        print("DRAWING FINISHED\n");
+        streaming = false;
+        resetStatus();
+      }
+      return;
+    }
+    if( gcode.get(line).trim().length() == 0 ){
+      line++;
+      continue;
+    }
+    else break;
+  }
+
+  String cmd = gcode.get(line).trim().replace(" ","");
+  if(SIMPLE_MODE){
+
+    if( !lastSent.contains(cmd) ){
+      port.write( cmd + "\n" );
+      issued++;
+      lastSent = cmd;
+      print("SENT "+line+": "+cmd+" : ");
+      sent = cmd;
+    }
+  } else {
+    if(VERBOSE) print( str(127 - sumList(c_line)) + " BYTES AVAILABLE\n" );
+    if( sumList(c_line) + (cmd.length()+1) <= 127 ){
+      c_line.append( cmd.length()+1 );
+      port.write(cmd + "\n");
+      issued++;
+      lastSent = cmd;
+      line++;
+      print("SENT "+line+": "+cmd+"\n");
+      sent = cmd;
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // GCODE
 ////////////////////////////////////////////////////////////////////////////////
 // G0/G1 - LINE COMMAND
@@ -212,8 +484,8 @@ String gSpray( boolean s ){
 }
 
 // Report
-String report(){
-  return "?";
+Byte report(){
+  return byte(0x3f);
 }
 
 // JOGGING
@@ -234,8 +506,8 @@ String home(){
   return gLine(0,0,false);
 }
 
-String gPause(){
-  return "!";
+Byte gPause(){
+  return byte(0x21);
 }
 
 Byte gDoor(){
@@ -246,8 +518,8 @@ Byte gReset(){
   return byte(0x18);
 }
 
-String gResume(){
-  return "~";
+Byte gResume(){
+  return byte(0x7e);
 }
 
 // PARK (GO TO MACHINE ZERO)
@@ -260,9 +532,14 @@ String park(){
 ////////////////////////////////////////////////////////////////////////////////
 
 // LOAD FILES
-void load(){
-  selectFolder("Select a folder to process:", "folderSelected");
+void loadSingle(){
+  selectInput("Select a file to load:", "fileSelected");
 }
+
+void loadFolder(){
+  selectFolder("Select a folder of drawings to load:", "folderSelected");
+}
+
 void folderSelected( File f ){
   if( f == null ){
     print("Window closed or user cancelled\n");
@@ -271,18 +548,41 @@ void folderSelected( File f ){
   fp = f.getAbsolutePath();
   print("User selected " + fp + "\n");
   String[] files = listFiles(fp);
-  if( files == null || !checkDir(files,"json")){
+  if( files == null || !checkDir(files,((type_gcode)?"txt":"json"))){
     loaded = false;
     fp = "";
     print( ((files==null)?"ERROR--EMPTY OR INVALID DIRECTORY\n":"ERROR--NO JSON DRAWING FILES IN DIRECTORY\n"));
     return;
   }
   loaded = true;
-  gcode = processFiles( files );
-  print("DRAWINGS LOADED\n");
-  print("GCODE LINES GENERATED: " + gcode.size() + "\n");
-  generatePreview(gcode);
-  print("GCODE PREVIEW GENERATED\n");
+  gcode = (type_gcode) ? processGCODEs( files ) : processJSONs( files );
+  if( gcode.size() > 0 ){
+    print("DRAWINGS LOADED\n");
+    print("GCODE LINES GENERATED: " + gcode.size() + "\n");
+    generatePreview(gcode);
+    print("GCODE PREVIEW GENERATED\n");
+    saveStrings( "data/gcode.txt", gcode.array() );
+  }
+  line = 0;
+}
+
+void fileSelected( File f ){
+  if( f == null ){
+    print("Window closed or user cancelled\n");
+    return;
+  }
+  fp = f.getAbsolutePath();
+  print( "User selected "+fp+"\n");
+  loaded = true;
+  gcode = (type_gcode) ? processGCODE(fp) : processJSON(fp);
+  if(gcode.size() > 0){
+    print( "DRAWING LOADED\n");
+    print( "GCODE LINES GENERATED: "+gcode.size()+"\n");
+    generatePreview(gcode);
+    if(VERBOSE) print("GCODE PREVIEW GENERATED");
+    saveStrings( "data/gcode.txt", gcode.array() );
+  }
+  line = 0;
 }
 
 // LIST FILES IN DIRECTORY
@@ -307,7 +607,7 @@ Boolean checkDir( String[] files, String ext ){
 }
 
 // PROCESS FILES
-StringList processFiles( String[] f ){
+StringList processJSONs( String[] f ){
   StringList g = new StringList(); //clear gcode buffer
   PVector p;
 
@@ -320,7 +620,9 @@ StringList processFiles( String[] f ){
     JSONArray coords = loadJSONArray( fp + "\\" + f[i] );
 
     p = extractPos( coords.getFloat(0), -coords.getFloat(1) );
+    g.append( gSpray(false) );
     g.append( gLine( p.x, p.y, false ) );
+    g.append( gDwell(0.5) );
     g.append( gSpray(true) );
 
     for( int k = 2; k < coords.size(); k+=2 ){
@@ -331,12 +633,76 @@ StringList processFiles( String[] f ){
   }
   g.append( gSpray(false) );
   g.append( home() );
-  g.append( home() );
 
   print("GCODE LINES GENERATED: " + g.size() + "\n");
+  return g;
+}
 
-  saveStrings( "data/gcode.txt", g.array() );
+StringList processGCODEs( String[] f ){
+  String[] load;
+  StringList g = new StringList();
 
+  g.append( gSpray(false) );
+  g.append( home() );
+
+  for(int i = 0; i < f.length; i++){
+    if( !fileCheck(f[i],"txt") ) continue;
+    load = loadStrings(fp+"\\"+f[i]);
+
+    for(int k = 0; k < load.length; k++){
+      g.append(load[k]);
+    }
+    g.append(gSpray(false));
+  }
+  g.append( gSpray(false));
+  g.append( home() );
+
+  return g;
+}
+
+StringList processJSON( String f ){
+  StringList g = new StringList();
+  if( !fileCheck(f,"json") ){
+    print("ERROR - NOT A JSON FILE\n");
+    return g;
+  }
+
+  PVector p;
+  JSONArray coords = loadJSONArray( f );
+  p = extractPos(coords.getFloat(0), -coords.getFloat(1));
+  g.append( gSpray(false) );
+  g.append( home() );
+
+  g.append( gLine( p.x, p.y, false ) );
+  g.append( gDwell(0.5) );
+  g.append( gSpray(true) );
+
+  for( int i = 2; i < coords.size(); i+=2 ){
+    p = extractPos( coords.getFloat(i),-coords.getFloat(i+1) );
+    g.append( gLine(p.x, p.y, true) );
+  }
+
+  g.append( gSpray(false) );
+  g.append( home() );
+
+  return g;
+}
+
+StringList processGCODE( String f ){
+  StringList g = new StringList();
+  if( !fileCheck(f,"txt") ){
+    print("ERROR - NOT A GCODE FILE\n");
+    return g;
+  }
+  String[] load = loadStrings(f);
+  g.append( gSpray(false) );
+  g.append( home() );
+
+  for (int i = 0; i < load.length; i++){
+    g.append( load[i] );
+  }
+  g.append( gSpray(false) );
+  g.append( home() );
   return g;
 }
 
@@ -421,18 +787,30 @@ void displayUI() {
   noStroke();
   fill(grey);
   rect(0,0,600,900);
+  noFill();
+  stroke(charcoal);
+  strokeWeight(1);
+  rect(15,40,320,320);
   // Controls Label
   fill(black);
   textFont(font24,24);
   textAlign(LEFT);
   text("MANUAL CONTROLS", 15, 30);
+  // File load Area
+  fill(black);
+  rect(0,375,590,70);
+
   // Console area
   fill(black);
-  rect(0,375,590,525);
-  noFill();
-  stroke(charcoal);
-  strokeWeight(1);
-  rect(15,40,320,320);
+  rect(0,450,590,305);
+
+  // Loading labels
+  fill(white);
+  textFont(font14,14);
+  textAlign(LEFT);
+  text("FILE TYPE",25,435);
+  text("LOAD MODE",110,435);
+
 }
 
 // RENDER NOZZLE POSITION
@@ -471,7 +849,7 @@ void displayStats(){
     fill(green);
     textAlign(LEFT);
     textFont(font24, 24);
-    text(sent, 15, 490);
+    text("TX: "+sent, 15, 560);
   }
   // RX Command
   if(val != null){
@@ -479,16 +857,39 @@ void displayStats(){
     fill(red);
     textAlign(LEFT);
     textFont(font18, 18);
-    text(val, 15, 520);
+    text("RX: "+val, 15, 590);
   }
 
+  //COMPLETION
+  noStroke();
+  fill(white);
+  textAlign(LEFT);
+  textFont(font18,18);
+  text("LINES SENT: "+issued+" / "+gcode.size(), 15, 620);
+  text("COMPLETED: "+completed+" / "+gcode.size(), 15, 640);
+
   // Serial Status
-  String status;
+  String serial_status;
   textFont(font18,18);
   fill( ((connected) ? green : red) );
-  status = (connected) ? "CONNECTED ON " + portname : "NOT CONNECTED";
-  text(status, 15, 740);
+  serial_status = (connected) ? "CONNECTED ON " + portname : "NOT CONNECTED";
+  text(serial_status, 15, 740);
 
+  // Machine status
+  textFont(font18,18);
+  fill( (status.contains("Idle")) ? white : (status.contains("Run")) ? green : red );
+  textAlign(CENTER);
+  text(status, origin.x, origin.y+350);
+
+  // File Selection
+  if(fp.length()>0){
+    String[] path = fp.split("\\\\");
+    int depth = path.length;
+    textFont(font18,18);
+    fill( white );
+    textAlign(LEFT);
+    text(join(subset(path,depth-2),"/"),210,415);
+  }
 }
 
 // SET UP UX CONTROLS
@@ -531,20 +932,6 @@ void setupControls() {
   .setColor(black)
   .setFont(font12)
   .setText("CONNECT")
-  ;
-
-  // Park Machine Button
-  cP5.addBang("park")
-  .setPosition(25,318)
-  .setSize(50,32)
-  .setTriggerEvent(Bang.RELEASE)
-  .setColorForeground(red)
-  //caption settings
-  .getCaptionLabel()
-  .align(ControlP5.CENTER, ControlP5.CENTER)
-  .setColor(black)
-  .setFont(font12)
-  .setText("PARK")
   ;
 
   // Y+100 button
@@ -747,57 +1134,103 @@ void setupControls() {
 
   // Set Origin Button
   cP5.addBang("origin")
-  .setPosition(345,300)
-  .setSize(120,50)
+  .setPosition(255,300)
+  .setSize(70,50)
   .setTriggerEvent(Bang.RELEASE)
-  .setColorForeground(black)
-  //caption settings
-  .getCaptionLabel()
-  .align(ControlP5.CENTER, ControlP5.CENTER)
-  .setColor(white)
-  .setFont(font14)
-  .setText("SET ORIGIN (0,0)")
-  ;
-
-  // Load Files Button
-  cP5.addBang("load-folder")
-  .setPosition(345,245)
-  .setSize(120,50)
-  .setTriggerEvent(Bang.RELEASE)
-  .setColorForeground(blue)
+  .setColorForeground(white)
+  .setColorActive(blue)
   //caption settings
   .getCaptionLabel()
   .align(ControlP5.CENTER, ControlP5.CENTER)
   .setColor(black)
   .setFont(font14)
-  .setText("LOAD")
+  .setText("SET (0,0)")
+  ;
+
+  // Park Machine Button
+  cP5.addBang("park")
+  .setPosition(25,300)
+  .setSize(70,50)
+  .setTriggerEvent(Bang.RELEASE)
+  .setColorForeground(white)
+  .setColorActive(red)
+  //caption settings
+  .getCaptionLabel()
+  .align(ControlP5.CENTER, ControlP5.CENTER)
+  .setColor(black)
+  .setFont(font14)
+  .setText("PARK")
   ;
 
   // Start Button
   cP5.addBang("start")
-  .setPosition(470,245)
-  .setSize(120,50)
+  .setPosition(345,245)
+  .setSize(245,50)
   .setTriggerEvent(Bang.RELEASE)
   .setColorForeground(green)
   //caption settings
   .getCaptionLabel()
   .align(ControlP5.CENTER, ControlP5.CENTER)
   .setColor(white)
-  .setFont(font14)
+  .setFont(font24)
   .setText("RUN FILE")
   ;
   // Pause Button
   cP5.addBang("pause")
-  .setPosition(470,300)
-  .setSize(120,50)
+  .setPosition(345,300)
+  .setSize(245,50)
   .setTriggerEvent(Bang.RELEASE)
   .setColorForeground(red)
   //caption settings
   .getCaptionLabel()
   .align(ControlP5.CENTER, ControlP5.CENTER)
   .setColor(white)
-  .setFont(font14)
+  .setFont(font24)
   .setText("PAUSE")
+  ;
+
+  // Load Files Button
+  cP5.addBang("load")
+  .setPosition(470,375)
+  .setSize(120,70)
+  .setTriggerEvent(Bang.RELEASE)
+  .setColorForeground(blue)
+  //caption settings
+  .getCaptionLabel()
+  .align(ControlP5.CENTER, ControlP5.CENTER)
+  .setColor(black)
+  .setFont(font18)
+  .setText("LOAD")
+  ;
+
+  cP5.addToggle("file-type")
+  .setPosition(25,390)
+  .setSize(80,30)
+  .setColorForeground(white)
+  .setColorBackground(white)
+  .setColorActive(white)
+  .setState(type_gcode)
+  //caption settings
+  .getCaptionLabel()
+  .align(ControlP5.CENTER, ControlP5.CENTER)
+  .setColor(black)
+  .setFont(font18)
+  .setText("JSON")
+  ;
+
+  cP5.addToggle("load-mode")
+  .setPosition(110,390)
+  .setSize(80,30)
+  .setColorForeground(white)
+  .setColorBackground(white)
+  .setColorActive(white)
+  .setState(load_dir)
+  //caption settings
+  .getCaptionLabel()
+  .align(ControlP5.CENTER, ControlP5.CENTER)
+  .setColor(black)
+  .setFont(font18)
+  .setText("FILE")
   ;
 
   // Canvas Width Entry
@@ -871,7 +1304,7 @@ void setupControls() {
 
   // Manual Command Entry
   cP5.addTextfield("cmdEntry")
-  .setPosition( 15, 390 )
+  .setPosition( 15, 460 )
   .setSize( 560, 50 )
   .setFont( font24 )
   .setFocus( true )
@@ -892,113 +1325,122 @@ void controlEvent( ControlEvent theEvent ) {
     String eventName = theEvent.getName();
     switch( eventName ) {
       case "report":
-      statusReport(paused);
-      break;
+        if(!streaming) statusReport();
+        break;
       case "connect":
-      if(connected){
-        port.stop();
-        portname = null;
-      }
-      selectSerial();
-      break;
+        if(connected){
+          port.stop();
+          portname = null;
+        }
+        selectSerial();
+        break;
       case "park":
-      send( park() );
-      break;
+        if(!streaming) send( park() );
+        break;
       case "y+100":
-      send( jog( 0, 100 ) );
-      break;
+        if(!streaming) send( jog( 0, 100 ) );
+        break;
       case "y+10":
-      send( jog( 0, 10 ) );
-      break;
+        if(!streaming) send( jog( 0, 10 ) );
+        break;
       case "y+1":
-      send( jog(0, 1) );
-      break;
+        if(!streaming) send( jog(0, 1) );
+        break;
       case "y-1":
-      send( jog(0,-1) );
-      break;
+        if(!streaming) send( jog(0,-1) );
+        break;
       case "y-10":
-      send( jog(0, -10) );
-      break;
+        if(!streaming) send( jog(0, -10) );
+        break;
       case "y-100":
-      send( jog(0, -100) );
-      break;
+        if(!streaming) send( jog(0, -100) );
+        break;
       case "x+100":
-      send( jog(100, 0) );
-      break;
+        if(!streaming) send( jog(100, 0) );
+        break;
       case "x+10":
-      send( jog(10, 0) );
-      break;
+        if(!streaming) send( jog(10, 0) );
+        break;
       case "x+1":
-      send( jog(1, 0) );
-      break;
+        if(!streaming) send( jog(1, 0) );
+        break;
       case "x-1":
-      send( jog(-1, 0) );
-      break;
+        if(!streaming) send( jog(-1, 0) );
+        break;
       case "x-10":
-      send( jog(-10, 0) );
-      break;
+        if(!streaming) send( jog(-10, 0) );
+        break;
       case "x-100":
-      send( jog(-100, 0) );
-      break;
+        if(!streaming) send( jog(-100, 0) );
+        break;
       case "home":
-      send( home() );
-      break;
+        if(!streaming) send( home() );
+        break;
       case "sprayOff":
-      // spraying = false;
-      send( gSpray(false) );
-      break;
+        if(!streaming) send( gSpray(false) );
+        break;
       case "sprayOn":
-      // spraying = true;
-      send( gSpray(true) );
-      break;
+        if(!streaming) send( gSpray(true) );
+        break;
       case "origin":
-      send( origin() );
-      break;
+        if(!streaming) send( origin() );
+        break;
       case "width":
       case "height":
       case "margin":
-      updateDim();
-      break;
-      case "speed":
-      updateSpeed();
-      break;
-      case "cmdEntry":
-      send( manualEntry() );
-      break;
-      case "load-folder":
-      load();
-      break;
-      case "start":
-      if(paused){
-        streaming = false;
-        line = 0;
-        sendByte( gReset() );
-        poll++;
-        send( home() );
-        paused = false;
+        if(!streaming) updateDim();
         break;
-      }
-      if(!streaming){
-        updateSpeed();
-        print("STARTING STREAM\n");
-        streaming = true;
-        stream();
-      }
-      break;
+      case "speed":
+        if(!streaming) updateSpeed();
+        break;
+      case "cmdEntry":
+        if(!streaming) send( manualEntry() );
+        break;
+      case "load":
+        if( load_dir ) loadFolder();
+        else loadSingle();
+        break;
+      case "load-mode":
+        if(!streaming) {
+          load_dir = !load_dir;
+          print("LOADING MODE: "+ ((load_dir)?"DIRECTORY":"SINGLE FILE") + "\n");
+        }
+        break;
+      case "file-type":
+        if(!streaming){
+          type_gcode = !type_gcode;
+          print("INPUT FILETYPE: "+ ((type_gcode)?"GCODE":"JSON") + "\n");
+        }
+        break;
+      case "start":
+        if(paused){
+          streaming = false;
+          resetStatus();
+          sendByte( gReset() );
+          delay(100);
+          send( home() );
+          paused = false;
+          break;
+        }
+        if(!streaming){
+          updateSpeed();
+          // print("STARTING STREAM\n");
+          streaming = true;
+          stream();
+        }
+        break;
       case "pause":
-      paused = !paused;
-      if(paused){
-        sendByte( gDoor() );
-        poll++;
-      } else {
-        send( gResume() );
-        poll++;
-        streaming = true;
-        stream();
-      }
-      break;
+        paused = !paused;
+        if(paused){
+          sendByte( gDoor() );
+        } else {
+          sendByte( gResume() );
+          streaming = true;
+          stream();
+        }
+        break;
       default:
-      break;
+        break;
     }
   }
 }
@@ -1007,9 +1449,14 @@ void controlEvent( ControlEvent theEvent ) {
 void checkStatus(){
   Bang start = cP5.get(Bang.class, "start");
   Bang pause = cP5.get(Bang.class, "pause");
-  Bang load = cP5.get(Bang.class, "load-folder");
+  Bang load = cP5.get(Bang.class, "load");
   Bang origin = cP5.get(Bang.class, "origin");
   Bang connect = cP5.get(Bang.class, "connect");
+  Toggle f_type = cP5.get(Toggle.class, "file-type");
+  Toggle l_type = cP5.get(Toggle.class, "load-mode");
+
+  relabelToggle( f_type, ((type_gcode)?"GCODE":"JSON"));
+  relabelToggle( l_type, ((load_dir)?"DIR":"FILE"));
 
   if( !connected ){
     lockButton( start, true, charcoal, grey );
@@ -1020,33 +1467,33 @@ void checkStatus(){
     return;
   }
 
-  if( connected ){
-    relabelButton( connect, "RECONNECT" );
-  }
-
-  if( !loaded && !paused ){
-    lockButton( start, true, charcoal, grey );
-    relabelButton( start, "START" );
-    lockButton( pause, false, red, white );
-    relabelButton( pause, "PAUSE" );
-    relabelButton( load, "LOAD");
-    return;
-  }
-
-  if( !loaded && paused ){
-    lockButton( start, true, charcoal, grey );
-    relabelButton( start, "START" );
-    lockButton( pause, false, green, white );
-    relabelButton( pause, "RESUME" );
-    relabelButton( load, "LOAD");
-    return;
-  }
+  // if( connected ){
+  //   relabelButton( connect, "RECONNECT" );
+  // }
+  //
+  // if( !loaded && !paused ){
+  //   lockButton( start, false, green, white );
+  //   relabelButton( start, "START" );
+  //   lockButton( pause, false, red, white );
+  //   relabelButton( pause, "PAUSE" );
+  //   relabelButton( load, "LOAD");
+  //   return;
+  // }
+  //
+  // if( !loaded && paused ){
+  //   lockButton( start, false, red, white );
+  //   relabelButton( start, "RESET" );
+  //   lockButton( pause, false, green, white );
+  //   relabelButton( pause, "RESUME" );
+  //   relabelButton( load, "LOAD");
+  //   return;
+  // }
 
   if( loaded ){
     relabelButton( load, "RELOAD" );
   }
 
-  if( streaming && !paused ){
+  if( (streaming && !paused) ){
     lockButton( start, false, blue, white );
     relabelButton( start, "RUNNING" );
     lockButton( pause, false, red, white );
@@ -1057,7 +1504,7 @@ void checkStatus(){
     return;
   }
 
-  if( streaming && paused ){
+  if( paused ){
     lockButton( start, false, red, white );
     relabelButton( start, "RESET" );
     lockButton( pause, false, green, white );
@@ -1082,12 +1529,19 @@ void checkStatus(){
 void relabelButton(Bang button, String newlabel){
   button.getCaptionLabel().setText(newlabel);
 }
+void relabelToggle(Toggle button, String newlabel){
+  button.getCaptionLabel().setText(newlabel);
+}
 
 // LOCK BUTTON
 void lockButton(Bang button, boolean lock, color c, color t){
   button.setLock(lock)
   .setColorForeground(c)
   .getCaptionLabel().setColor(t);
+}
+
+void lockButton(Toggle button, boolean lock, color c, color t){
+  button.setLock(lock);
 }
 
 // MANUAL ENTRY
@@ -1111,144 +1565,4 @@ void updateSpeed(){
   String s_ = cP5.get(Textfield.class, "speed").getText();
   spray_speed = (s_ != "" && float(s_)>0 && float(s_)<=10000) ? float(s_) : spray_speed;
   send("G1F"+str(spray_speed)+"\n");
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// SERIAL COMMUNICATION
-////////////////////////////////////////////////////////////////////////////////
-
-// OPEN SERIAL PORT
-void openSerial(){
-  if( portname == null ){
-    connected = false;
-    return;
-  }
-  if( port != null ) port.stop();
-
-  port = new Serial(this, portname, 115200);
-  port.bufferUntil('\n');
-  connected = true;
-}
-
-// SELECT SERIAL PORT
-// void serialEvent(Serial s){
-//   String temp = port.readStringUntil('\n');
-//   if (temp == null) return;
-//   if (extractDim( temp )) return;
-//   // if (val != temp) print( temp + "\n");
-//   if (temp.startsWith("ok")){
-//     if (poll > 0){
-//       // print(poll+"\n");
-//       poll--;
-//       return;
-//     }
-//     if (streaming) line++;
-//     stream();
-//   }
-// }
-
-void selectSerial(){
-  int s = Serial.list().length;
-  if( s == 0 ){
-    JOptionPane.showMessageDialog(null, "No Arduino Connected");
-    return;
-  }
-  if( s > 1){
-    String result = (String) JOptionPane.showInputDialog(
-      null,
-      "Select the serial port connected to Arduino",
-      "Select serial port",
-      JOptionPane.PLAIN_MESSAGE,
-      null,
-      Serial.list(),
-      0
-    );
-    if( result != null ) portname = result;
-  }
-  else portname = Serial.list()[0];
-  openSerial();
-}
-
-void serialRun(){
-  if(port.available() > 0){
-    String temp = port.readStringUntil('\n');
-    // print( temp );
-    if (temp == null) return;
-    if (extractDim( temp )) return;
-    // if (val != temp) print( temp + "\n");
-    if (temp.startsWith("ok")){
-      // if (poll > 0){
-        // print(poll+"\n");
-        // poll--;
-        // return;
-      // }
-      if (streaming) line++;
-      stream();
-    }
-    // if (streaming){
-    //   if(temp.startsWith("ok")) line++;
-    //   stream();
-    // }
-    // val = temp;
-    // print( val + "\n" );
-  }
-}
-
-void statusReport(boolean p){
-  port.write( report() + "\n" );
-}
-
-boolean extractDim( String v ){
-  String regex = "<*>".replaceAll(".","[$0]").replace("[*]",".*");
-  if (v == null) return false;
-  if ( !v.matches(regex) ) return false;
-  println(v);
-  int startChar = v.indexOf("WPos:")+5;
-  int endChar = v.indexOf("|", startChar);
-  // int endChar = v.indexOf(">", startChar);
-  if( startChar < 0 || endChar < 0) return true;
-  String[] p_ = v.substring(startChar,endChar).split(",");
-  posx = float(p_[0]);
-  posy = float(p_[1]);
-  startChar = v.indexOf("FS:")+3;
-  endChar = v.indexOf("|", startChar);
-  if( startChar < 0 || endChar < 0) return true;
-  int servo = int( v.substring(startChar,endChar).split(",")[1]);
-  spraying = (servo == sprayon);
-  return true;
-}
-
-// SERIAL SEND
-void send( String cmd ){
-  if(!connected) return;
-  sent = join(cmd.split("\n")," ");
-  port.write(cmd.trim().replace(" ","") + "\n");
-
-  if( VERBOSE ) print("SENT: " + cmd + '\n');
-}
-
-// SERIAL SEND BYTE
-void sendByte( Byte b ){
-  if(!connected) return;
-  port.write( b );
-}
-
-// SERIAL STREAM
-void stream(){
-  if(!connected || !streaming) return;
-
-  while(true){
-    if( line == gcode.size() ){
-      print("COMPLETED\n");
-      streaming = false;
-      return;
-    }
-    if( gcode.get(line).trim().length() == 0 ){
-      line++;
-      continue;
-    }
-    else break;
-  }
-  print(line + " " + gcode.get(line) + "\n");
-  port.write(gcode.get(line).trim().replace(" ","") + "\n");
 }
