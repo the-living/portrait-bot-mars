@@ -1,8 +1,8 @@
 # Portrait-bot Firmware
 
-The _Portrait-bot_ is driven by an Arduino UNO with a CNC Shield running [*grbl-servo* by cprezzi](https://github.com/cprezzi/grbl-servo) firmware. It is a modified version of GRBL v1.1, with modifications to add servo functionality (instead of a traditional CNC spindle). Please refer to the [GRBL v1.1 wiki](https://github.com/gnea/grbl/wiki) for more information on its capabilities and interfacing methods.
+The _Portrait-bot_ is driven by an Arduino UNO with a [CNC Shield](http://blog.protoneer.co.nz/arduino-cnc-shield/) running [grbl-servo](https://github.com/cprezzi/grbl-servo) firmware. It is a modified version of [GRBL v1.1](https://github.com/gnea/grbl/) that replaces the spindle functionality with controls for a servo motor. Please refer to the [GRBL wiki](https://github.com/gnea/grbl/wiki) for more information on its capabilities and interfacing methods.
 
-Loading the Arduino with the correct firmware and settings should only need to be done once.
+Loading the Arduino with the correct firmware and settings should only need to be done once -- GRBL stores machine settings on its onboard EEPROM memory.
 
 ### UPDATING THE FIRMWARE
 In order to use the portrait-bot controller application, the connected arduino must be running the correct version of GRBL. There are two methods to flash the firmware to the arduino.
